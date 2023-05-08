@@ -19,7 +19,7 @@ const PRIVATE_KEY_1 = "0x67842f5e4fa0edb34c9b4adbe8c3c1f3c737941f7c875d18bc6ec2f
 const ADDRESS_1 = "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqvc32wruaxqnk4hdj8yr4yp5u056dkhwtc94sy8q";
 
 // This is the TX fee amount that will be paid in Shannons.
-const TX_FEE = 100_000n;
+const TX_FEE = 200_000n;
 
 async function deployCode(indexer) {
 	console.log("DEPLOY CODE\n");

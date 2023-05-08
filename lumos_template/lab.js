@@ -78,8 +78,8 @@ async function setupCells(NODE_URL, indexer) {
 	const recycleCapacity = recycleCells.reduce((a, c) => a + hexToInt(c.cellOutput.capacity), 0n);
 
 	// Create cells for the funding address.
-	for (let i = 0; i < 10; i++) {
-		const outputCapacity1 = intToHex(ckbytesToShannons(10_000n));
+	for (let i = 0; i < 100; i++) {
+		const outputCapacity1 = intToHex(ckbytesToShannons(100_000n));
 		const output1 = { cellOutput: { capacity: outputCapacity1, lock: addressToScript(ADDRESS_2), type: null }, data: "0x" };
 		transaction = transaction.update("outputs", (i) => i.push(output1));
 	}
