@@ -27,7 +27,7 @@ const ADDRESS_1 = "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqvc3
 // This is the TX fee amount that will be paid in Shannons.
 const TX_FEE = 100_000n;
 
-const DEPOSIT_AMOUNT = ckbytesToShannons(100_000n);
+const DEPOSIT_AMOUNT = ckbytesToShannons(50_000n);
 const DEPOSIT_QUANTITY = 1;
 
 const AR_0 = 10000000000000000n;
@@ -175,6 +175,11 @@ async function depositPhaseTwo(indexer, rpc, receiptOutPoint, ownerLockOutPoint)
 	for (const s of [ICKB_DOMAIN_LOGIC, SUDT]) {
 		const cellDep = { depType: s.DEP_TYPE, outPoint: { txHash: s.TX_HASH, index: s.INDEX }, };
 		transaction = transaction.update("cellDeps", (cellDeps) => cellDeps.push(cellDep));
+	}
+
+	// Add the header deps.
+	for (const b of [transactionProof.blockHash]) {
+		transaction = transaction.update("headerDeps", (headerDeps) => headerDeps.push(b));
 	}
 
 	// Add input receipt cell and owner lock cell to the transaction.
