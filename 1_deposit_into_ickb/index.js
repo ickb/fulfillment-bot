@@ -9,11 +9,12 @@ import { initializeConfig } from "@ckb-lumos/config-manager";
 import { addressToScript, sealTransaction, TransactionSkeleton } from "@ckb-lumos/helpers";
 import { Indexer } from "@ckb-lumos/ckb-indexer";
 import { addDefaultCellDeps, addDefaultWitnessPlaceholders, collectCapacity, getLiveCell, indexerReady, readFileToHexString, readFileToHexStringSync, sendTransaction, signTransaction, waitForTransactionConfirmation } from "../lib/index.js";
-import { ckbytesToShannons, hexToArrayBuffer, hexToInt, intToHex, intToU64LeHexBytes } from "../lib/util.js";
+import { ckbytesToShannons, hexToArrayBuffer, hexToInt, intToHex, intToU64LeHexBytes, intToU128LeHexBytes } from "../lib/util.js";
 import { describeTransaction, initializeLab } from "../lumos_template/lab.js";
 const CONFIG = JSON.parse(fs.readFileSync("../config.json"));
 const DAO = CONFIG.SCRIPTS.DAO;
 const ICKB_DOMAIN_LOGIC = CONFIG.SCRIPTS.ICKB_DOMAIN_LOGIC;
+const SUDT = CONFIG.SCRIPTS.SUDT;
 
 // CKB Node and CKB Indexer Node JSON RPC URLs.
 const NODE_URL = "http://127.0.0.1:8114/";
@@ -29,8 +30,31 @@ const TX_FEE = 100_000n;
 const DEPOSIT_AMOUNT = ckbytesToShannons(100_000n);
 const DEPOSIT_QUANTITY = 1;
 
-async function depositPhaseOne(indexer) {
+const AR_0 = 10000000000000000n;
+const STANDARD_DEPOSIT_SIZE = ckbytesToShannons(100_000n);
+
+function iCKB_value(unoccupied_capacity, header) {
+	const daoData = extractDaoDataCompatible(header.dao);
+	const AR_m = BigInt(daoData["ar"]);
+
+	let s = unoccupied_capacity * AR_0 / AR_m;
+	if (s > STANDARD_DEPOSIT_SIZE) {
+		s = s - (s - STANDARD_DEPOSIT_SIZE) / 10
+	}
+	return s;
+}
+
+function receipt_iCKB_value(receipt_amount, receipt_count, header) {
+	return BigInt(receipt_count) * iCKB_value(receipt_amount, header);
+}
+
+async function depositPhaseOne(indexer, rpc) {
 	console.log("DEPOSIT PHASE ONE\n");
+
+	const header = await rpc.getTipHeader();
+	if (iCKB_value(DEPOSIT_AMOUNT, header) > STANDARD_DEPOSIT_SIZE) {
+		throw new Error("Deposit too big");
+	}
 
 	// Create a transaction skeleton.
 	let transaction = TransactionSkeleton();
@@ -80,6 +104,21 @@ async function depositPhaseOne(indexer) {
 	};
 	transaction = transaction.update("outputs", (i) => i.push(receipt));
 
+	// Create a cell with ickb lock for SUDT verification in deposit phase two.
+	const ickb_owner_lock = {
+		cellOutput: {
+			capacity: intToHex(ckbytesToShannons(41n)),
+			lock: {
+				codeHash: ICKB_DOMAIN_LOGIC.CODE_HASH,
+				hashType: ICKB_DOMAIN_LOGIC.HASH_TYPE,
+				args: "0x"
+			},
+			type: null
+		},
+		data: "0x"
+	};
+	transaction = transaction.update("outputs", (i) => i.push(ickb_owner_lock));
+
 	// Add input capacity cells.
 	let outputCapacity = transaction.outputs.toArray().reduce((a, c) => a + hexToInt(c.cellOutput.capacity), 0n);
 	const capacityRequired = outputCapacity + ckbytesToShannons(61n) + TX_FEE;
@@ -113,46 +152,57 @@ async function depositPhaseOne(indexer) {
 	console.log("\n");
 
 	// Return the out point for the receipt cell so it can be used in the next transaction.
-	const outPoint = { txHash: txid, index: intToHex(DEPOSIT_QUANTITY) };
+	const receiptOutPoint = { txHash: txid, index: intToHex(DEPOSIT_QUANTITY) };
 
-	return outPoint;
+	// Return the out point for the owner lock cell so it can be used in the next transaction.
+	const ownerLockOutPoint = { txHash: txid, index: intToHex(DEPOSIT_QUANTITY + 1) };
+
+	return [receiptOutPoint, ownerLockOutPoint];
 }
 
-async function depositPhaseTwo(indexer, receiptOutPoint) {
+async function depositPhaseTwo(indexer, rpc, receiptOutPoint, ownerLockOutPoint) {
 	console.log("DEPOSIT PHASE TWO\n");
 
-	const rpc = new RPC(INDEXER_URL, indexer);
 	const transactionProof = await rpc.getTransactionProof([receiptOutPoint.txHash]);
 	const header = await rpc.getHeader(transactionProof.blockHash);
-	const daoData = extractDaoDataCompatible(header.dao);
-	console.log("AR:", daoData["ar"].toString());
-	return
+	const ickb_sudt_amount = receipt_iCKB_value(DEPOSIT_AMOUNT, DEPOSIT_QUANTITY, header);
 
 	// Create a transaction skeleton.
 	let transaction = TransactionSkeleton();
 
 	// Add the cell deps.
 	transaction = addDefaultCellDeps(transaction);
-	for (const s of [ICKB_DOMAIN_LOGIC]) {
+	for (const s of [ICKB_DOMAIN_LOGIC, SUDT]) {
 		const cellDep = { depType: s.DEP_TYPE, outPoint: { txHash: s.TX_HASH, index: s.INDEX }, };
 		transaction = transaction.update("cellDeps", (cellDeps) => cellDeps.push(cellDep));
 	}
 
-	// Create a receipt cell for three deposits of DEPOSIT_AMOUNT + occupied capacity.
-	const receipt = {
+	// Add input receipt cell and owner lock cell to the transaction.
+	for (const outPoint of [receiptOutPoint, ownerLockOutPoint]) {
+		const input = await getLiveCell(NODE_URL, outPoint);
+		transaction = transaction.update("inputs", (i) => i.push(input));
+	}
+
+	// Create an output sudt cell
+	const ickb_sudt = {
 		cellOutput: {
-			capacity: intToHex(ckbytesToShannons(102n)),
+			capacity: intToHex(ckbytesToShannons(142n)),
 			lock: addressToScript(ADDRESS_1),
 			type: {
-				codeHash: ICKB_DOMAIN_LOGIC.CODE_HASH,
-				hashType: ICKB_DOMAIN_LOGIC.HASH_TYPE,
-				args: "0x"
+				codeHash: SUDT.CODE_HASH,
+				hashType: SUDT.HASH_TYPE,
+				args: utils.computeScriptHash(
+					{
+						codeHash: ICKB_DOMAIN_LOGIC.CODE_HASH,
+						hashType: ICKB_DOMAIN_LOGIC.HASH_TYPE,
+						args: "0x"
+					}
+				)
 			}
 		},
-		// DEPOSIT_QUANTITY deposits of DEPOSIT_AMOUNT + occupied capacity.
-		data: intToU64LeHexBytes((BigInt(DEPOSIT_QUANTITY) * 2n ** (6n * 8n)) + DEPOSIT_AMOUNT)
+		data: intToU128LeHexBytes(ickb_sudt_amount)
 	};
-	transaction = transaction.update("outputs", (i) => i.push(receipt));
+	transaction = transaction.update("outputs", (i) => i.push(ickb_sudt));
 
 	// Add input capacity cells.
 	let outputCapacity = transaction.outputs.toArray().reduce((a, c) => a + hexToInt(c.cellOutput.capacity), 0n);
@@ -186,13 +236,10 @@ async function depositPhaseTwo(indexer, receiptOutPoint) {
 	await waitForTransactionConfirmation(NODE_URL, txid);
 	console.log("\n");
 
-	// Return the out points for the receipt cell so it can be used in the next transaction.
-	const outPoints =
-		[
-			{ txHash: txid, index: intToHex(DEPOSIT_QUANTITY) },
-		];
+	// Return the out points for the ickb token cell so it can be used in the next transaction.
+	const outPoint = { txHash: txid, index: intToHex(DEPOSIT_QUANTITY) }
 
-	return outPoints;
+	return outPoint;
 }
 
 async function main() {
@@ -206,12 +253,14 @@ async function main() {
 	await initializeLab(NODE_URL, indexer);
 	await indexerReady(indexer);
 
+	const rpc = new RPC(INDEXER_URL, indexer);
+
 	// Create a deposits and receipt cell.
-	const receiptOutPoint = await depositPhaseOne(indexer);
+	const [receiptOutPoint, ownerLockOutPoint] = await depositPhaseOne(indexer, rpc);
 	await indexerReady(indexer);
 
 	// Transform the receiptOutPoint into iCKB SUDT
-	await depositPhaseTwo(indexer, receiptOutPoint);
+	await depositPhaseTwo(indexer, rpc, receiptOutPoint, ownerLockOutPoint);
 	await indexerReady(indexer);
 
 	console.log("Execution completed successfully!");
