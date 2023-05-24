@@ -35,7 +35,7 @@ message = "0x"
 
 ```toml
 [logger]
-filter = "info,ckb-script=debug"# instead "info"
+filter = "info,ckb-script=debug"# instead of "info"
 # Other parameters...
 ```
 
@@ -63,23 +63,6 @@ value = 200 # instead of 5000
 (trap 'kill -INT 0' SIGINT; cd ~/ckb/; ckb run --indexer & sleep 1 && ckb miner)
 ```
 
-7. Create Private Key Files:
-
-``` bash
-echo 0xd00c06bfd800d27397002dca6fb0993d5ba6399b4238b2f29ee9deb97593d2bc > pk1
-echo 0x63d86723e08f0f813a36ce6aa123bb2289d90680ae1e99d4de8cdb334553f24d > pk2
-```
-
-8. Import the Private Keys:
-
-``` bash
-ckb-cli account import --privkey-path pk1
-```
-
-``` bash
-ckb-cli account import --privkey-path pk2
-```
-
 ### Configure project with local devchain
 
 1. Download this repo in a folder of your choice:  
@@ -94,8 +77,14 @@ git clone https://github.com/ickb/v1-bot-demo.git
 cd v1-bot-demo
 ```
 
-3. Populate config.json and deploy scripts on devnet:
+3. Install dependencies:
 
 ```bash
-(cd ~/ckb && ckb list-hashes --format json) | (cd 0_deploy_scripts && node index.js)
+npm i
+```
+
+4. Run bot demo:
+
+```bash
+npm run start
 ```
