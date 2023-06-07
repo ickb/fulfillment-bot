@@ -1,174 +1,386 @@
 
-import fs from "fs";
-import util from "util";
-import { Account } from "./utils";
+import { Account } from "./account";
+import { defaultScript, getIndexer, getNodeUrl, getRPC, ickbSudtScript, parseEpoch, scriptEq } from "./utils";
 import { secp256k1Blake160 } from "@ckb-lumos/common-scripts";
 import { RPC } from "@ckb-lumos/rpc";
 import { BI, parseUnit } from "@ckb-lumos/bi"
-import { TransactionSkeletonType, sealTransaction } from "@ckb-lumos/helpers";
+import { TransactionSkeleton, TransactionSkeletonType, minimalCellCapacityCompatible, sealTransaction } from "@ckb-lumos/helpers";
 import { key } from "@ckb-lumos/hd";
-import { Config, getConfig } from "@ckb-lumos/config-manager/lib";
+import { getConfig } from "@ckb-lumos/config-manager/lib";
 import { computeScriptHash } from "@ckb-lumos/base/lib/utils";
 import { bytes } from "@ckb-lumos/codec";
-import { Cell, OutPoint, Script, Transaction, blockchain } from "@ckb-lumos/base";
+import { Cell, Header, Hexadecimal, Script, Transaction, WitnessArgs, blockchain } from "@ckb-lumos/base";
 import { CellCollector, Indexer } from "@ckb-lumos/ckb-indexer";
 import { CKBIndexerQueryOptions } from "@ckb-lumos/ckb-indexer/lib/type";
-import { PathOrFileDescriptor } from "fs";
+import { calculateDaoEarliestSinceCompatible, calculateMaximumWithdrawCompatible, extractDaoDataCompatible } from "@ckb-lumos/common-scripts/lib/dao";
+import { Uint128LE, Uint64LE } from "@ckb-lumos/codec/lib/number/uint";
+import { hexify } from "@ckb-lumos/codec/lib/bytes";
 
-// CKB Indexer Node JSON RPC URLs.
-export const INDEXER_URL = "http://127.0.0.1:8114/";
+export class TransactionBuilder {
+    #accountLockScript: Script;
 
-export const readFile = util.promisify(fs.readFile)
+    #indexer: Indexer;
+    #rpc: RPC;
+    #blockNumber2BlockHash: { [id: Hexadecimal]: Hexadecimal; };
+    #blockHash2Header: { [id: Hexadecimal]: Header; };
 
-export async function localConfig(): Promise<Config> {
-    const rpc = new RPC(INDEXER_URL, { timeout: 10000 });
-    const genesisBlock = await rpc.getBlockByNumber("0x0");
+    #inputs: Cell[];
+    #outputs: Cell[];
 
-    return {
-        PREFIX: "ckt",
-        SCRIPTS: {
-            SECP256K1_BLAKE160: {
-                CODE_HASH: "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8",
-                HASH_TYPE: "type",
-                TX_HASH: genesisBlock.transactions[1].hash!,
-                INDEX: "0x0",
-                DEP_TYPE: "depGroup",
-            },
-            DAO: {
-                CODE_HASH: "0x82d76d1b75fe2fd9a27dfbaa65a039221a380d76c926f378d3f81cf3e7e13f2e",
-                HASH_TYPE: "type",
-                TX_HASH: genesisBlock.transactions[0].hash!,
-                INDEX: "0x2",
-                DEP_TYPE: "code"
-            }
+    constructor(accountLockScript: Script) {
+        this.#accountLockScript = accountLockScript;
+
+        this.#indexer = getIndexer();
+        this.#rpc = getRPC();
+
+        this.#blockNumber2BlockHash = {};
+        this.#blockHash2Header = {};
+
+        this.#inputs = [];
+        this.#outputs = [];
+    }
+
+    async fund() {
+        const capacityCells = await this.#collect({ type: "empty", withData: false });
+        const sudtCells = await this.#collect({ type: ickbSudtScript() });
+        this.add("input", "end", ...capacityCells, ...sudtCells);
+
+        const ickbDomainLogicScript = defaultScript("ICKB_DOMAIN_LOGIC")
+
+        const receiptCells = await this.#collect({ type: ickbDomainLogicScript });
+        const ownerLockCells = await this.#collect({ lock: ickbDomainLogicScript, type: "empty", withData: false });//////////////////
+        if (receiptCells.length > 0 && ownerLockCells.length > 0) {
+            this.add("input", "end", ...receiptCells, ...ownerLockCells);
         }
-    };
-}
-
-export function defaultScript(name: string): Script {
-    let script_config_data = getConfig().SCRIPTS[name]!;
-    return {
-        codeHash: script_config_data.CODE_HASH,
-        hashType: script_config_data.HASH_TYPE,
-        args: "0x"
-    };
-}
-
-export function ickbSudtScript(): Script {
-    let SUDT = getConfig().SCRIPTS.SUDT!;
-    let ICKB_DOMAIN_LOGIC = getConfig().SCRIPTS.ICKB_DOMAIN_LOGIC!;
-    return {
-        codeHash: SUDT.CODE_HASH,
-        hashType: SUDT.HASH_TYPE,
-        args: computeScriptHash(
-            {
-                codeHash: ICKB_DOMAIN_LOGIC.CODE_HASH,
-                hashType: ICKB_DOMAIN_LOGIC.HASH_TYPE,
-                args: "0x"
-            }
-        )
-    }
-}
-
-export function addOutputs(transaction: TransactionSkeletonType, roleTag: string, ...outputs: Cell[]) {
-    // We are abusing witnesses field to tag the cell output role in the transaction
-    if (transaction.outputs.size != transaction.witnesses.size) {
-        throw Error("Witnesses and output are of different length");
-    }
-
-    let roleTags = Array.from({ length: outputs.length }, () => roleTag)
-
-    transaction = transaction.update("outputs", (o) => o.push(...outputs));
-    transaction = transaction.update("witnesses", (w) => w.push(...roleTags));
-
-    return transaction;
-}
-
-function popRoleTags(transaction: TransactionSkeletonType) {
-    // We are abusing witnesses field to tag the cell output role in the transaction
-    if (transaction.outputs.size != transaction.witnesses.size) {
-        throw Error("Witnesses and output are of different length");
-    }
-
-    let roleTags = transaction.witnesses.toArray();
-
-    // Reset witnesses field to its default value
-    transaction = transaction.remove("witnesses");
-
-    return { transaction, roleTags }
-}
-
-async function collectCapacity(query: CKBIndexerQueryOptions, capacityRequired: BI) {
-    // Initialize an Indexer instance.
-    const indexer = new Indexer(INDEXER_URL);
-    await indexer.waitForSync();
-
-    const cellCollector = new CellCollector(indexer, query);
-
-    let inputCells = [];
-    let inputCapacity = BI.from(0);
-
-    for await (const cell of cellCollector.collect()) {
-        inputCells.push(cell);
-        inputCapacity = inputCapacity.add(BI.from(cell.cellOutput.capacity));
-
-        if (capacityRequired.lte(inputCapacity))
-            break;
-    }
-
-    if (inputCapacity.lt(capacityRequired))
-        throw new Error("Unable to collect enough cells to fulfill the capacity requirements.");
-
-    return inputCells;
-}
-
-async function addCapacity(transaction: TransactionSkeletonType, account: Account) {
-    // Get the sum of the outputs.
-    const getOutputCapacity = () => transaction.outputs.toArray().reduce(
-        (a, c) => a.add(c.cellOutput.capacity), BI.from(0)
-    );
-    const getInputCapacity = () => transaction.inputs.toArray().reduce(
-        (a, c) => a.add(c.cellOutput.capacity), BI.from(0)
-    );
-
-    let inputCapacity = getInputCapacity();
-    let outputCapacity = getOutputCapacity();
-
-    // Transaction Fee
-    const TX_FEE = BI.from(200_000n); // BI.from(100_000n);////////////////////////////////////////////////////////
-
-    if (inputCapacity == outputCapacity.add(TX_FEE)) {
-        // do nothing        
-    } else {
-        if (inputCapacity.lt(outputCapacity.add(parseUnit("61", "ckb")).add(TX_FEE))) {
-            // Add input capacity cells to the transaction.
-            const query: CKBIndexerQueryOptions = { lock: account.lockScript, type: "empty" };
-            const neededCapacity = outputCapacity.add(parseUnit("61", "ckb")).add(TX_FEE).sub(inputCapacity);
-            const collectedCells = await collectCapacity(query, neededCapacity);
-            transaction = transaction.update("inputs", (i) => i.push(...collectedCells));
-            inputCapacity = getInputCapacity();
+        if (ownerLockCells.length == 0 || receiptCells.length > 0) {
+            this.add("output", "end", {
+                cellOutput: {
+                    capacity: parseUnit("41", "ckb").toHexString(),
+                    lock: ickbDomainLogicScript,
+                    type: undefined//use SECP256K1_BLAKE160?/////////////////////////////////////////////////////////
+                },
+                data: "0x"
+            });
         }
 
-        // Create a change Cell for the remaining CKBytes.
-        const changeCapacity = inputCapacity.sub(outputCapacity).sub(TX_FEE).toHexString();
-        let change: Cell = {
+        const unlockableWithdrawedDaoCells: Cell[] = [];
+        const currentEpoch = parseEpoch((await this.#rpc.getTipHeader()).epoch);
+        for (const c of await this.#collect({ type: defaultScript("DAO") })) {
+            if (c.data === "0x0000000000000000") {
+                continue;
+            }
+
+            const unlockEpoch = parseEpoch(await this.#withdrawedDaoSince(c));
+
+            if (currentEpoch.number.lt(unlockEpoch.number)) {
+                continue;
+            }
+
+            if (currentEpoch.index.mul(unlockEpoch.length).lt(unlockEpoch.index.mul(currentEpoch.length))) {
+                continue;
+            }
+
+            unlockableWithdrawedDaoCells.push(c);
+        }
+        this.add("input", "end", ...unlockableWithdrawedDaoCells);
+
+        return this;
+    }
+    async #collect(query: CKBIndexerQueryOptions) {
+        await this.#indexer.waitForSync();
+        let result: Cell[] = [];
+        const collector = new CellCollector(this.#indexer, {
+            scriptSearchMode: "exact",
+            withData: true,
+            lock: this.#accountLockScript,
+            ...query
+        }, {
+            withBlockHash: true,
+            ckbRpcUrl: getNodeUrl()
+        });
+        for await (const cell of collector.collect()) {
+            result.push(cell);
+        }
+
+        return result;
+    }
+
+    add(source: "input" | "output", position: "start" | "end", ...cells: Cell[]) {
+        if (source === "input") {
+            if (position === "start") {
+                this.#inputs.unshift(...cells);
+            } else {
+                this.#inputs.push(...cells);
+            }
+
+            if (this.#inputs.some((c) => !c.blockHash || !c.blockNumber)) {
+                throw Error("All input cells must have both blockHash and blockNumber populated");
+            }
+        } else {
+            if (position === "start") {
+                this.#outputs.unshift(...cells);
+            } else {
+                this.#outputs.push(...cells);
+            }
+        }
+
+        return this;
+    }
+
+    deposit(depositAmount: BI, depositQuantity: number) {
+        if (depositAmount.gte(DEPOSIT_AMOUNT_LIMIT)) {
+            throw Error(`depositAmount is ${depositAmount}, but should be less than ${DEPOSIT_AMOUNT_LIMIT.toString()}`);
+        }
+
+        if (depositQuantity > 61) {
+            throw Error(`depositQuantity is ${depositQuantity}, but should be less than 62`);
+        }
+
+        // Create depositQuantity deposits of occupied capacity + depositAmount.
+        const deposit = {
             cellOutput: {
-                capacity: changeCapacity,
-                lock: account.lockScript,
-                type: undefined
+                capacity: parseUnit("82", "ckb").add(depositAmount).toHexString(),
+                lock: defaultScript("ICKB_DOMAIN_LOGIC"),
+                type: defaultScript("DAO"),
             },
-            data: "0x"
+            data: hexify(Uint64LE.pack(0))
         };
 
-        transaction = addOutputs(transaction, "change", change);
-        // outputCapacity = getOutputCapacity();
+        // Create a receipt cell for depositQuantity deposits of depositAmount + occupied capacity.
+        const receipt = {
+            cellOutput: {
+                capacity: parseUnit("102", "ckb").toHexString(),
+                lock: this.#accountLockScript,
+                type: defaultScript("ICKB_DOMAIN_LOGIC")
+            },
+            // depositQuantity deposits of depositAmount + occupied capacity.
+            // (( 2n ** (6n * 8n)) * depositQuantity) + depositAmount
+            data: hexify(Uint64LE.pack(DEPOSIT_AMOUNT_LIMIT.mul(depositQuantity).add(depositAmount)))//modify script?///////
+        };
+
+        return this.add("output", "end", ...Array.from({ length: depositQuantity }, () => deposit), receipt);
     }
 
-    return transaction;
+    withdrawFrom(...deposits: Cell[]) {
+        const dao = defaultScript("DAO");
+        const withdrawals: Cell[] = [];
+        for (const deposit of deposits) {
+            const withdrawal = {
+                cellOutput: {
+                    capacity: deposit.cellOutput.capacity,
+                    lock: this.#accountLockScript,
+                    type: dao
+                },
+                data: hexify(Uint64LE.pack(BI.from(deposit.blockNumber)))
+            };
+            withdrawals.push(withdrawal);
+        }
+
+        return this.add("input", "start", ...deposits).add("output", "start", ...withdrawals);
+    }
+
+    async build(fee: BI = BI.from("200000")) {
+        const ckbDelta = (await this.getCkbDelta()).sub(fee);
+        const ickbDelta = await this.getIckbDelta();
+
+        const changeCells: Cell[] = [];
+        if (ckbDelta.eq(0) && ickbDelta.eq(0)) {
+            //Do nothing
+        } else if (ckbDelta.gte(parseUnit("62", "ckb")) && ickbDelta.eq(0)) {
+            changeCells.push({
+                cellOutput: {
+                    capacity: ckbDelta.toHexString(),
+                    lock: this.#accountLockScript,
+                    type: undefined,
+                },
+                data: "0x"
+            });
+        } else if (ckbDelta.gte(parseUnit("142", "ckb")) && ickbDelta.gt(0)) {
+            changeCells.push({
+                cellOutput: {
+                    capacity: ckbDelta.toHexString(),
+                    lock: this.#accountLockScript,
+                    type: ickbSudtScript()
+                },
+                data: hexify(Uint128LE.pack(ickbDelta))
+            });
+        } else {
+            throw Error("Not enough funds to execute the transaction");
+        }
+
+        let transaction = TransactionSkeleton();
+        transaction = transaction.update("inputs", (i) => i.push(...this.#inputs));
+        transaction = transaction.update("outputs", (o) => o.push(...this.#outputs, ...changeCells));
+
+        transaction = addCellDeps(transaction);
+
+        transaction = await addHeaderDeps(transaction, async (blockNumber: string) => this.#getBlockHash(blockNumber));
+
+        transaction = await addInputSinces(transaction, async (c: Cell) => this.#withdrawedDaoSince(c));
+
+        transaction = await addWitnessPlaceholders(transaction, async (blockNumber: string) => this.#getBlockHash(blockNumber));
+
+        // Print the details of the transaction to the console.
+        // console.log(JSON.stringify(transaction, undefined, 2));
+
+        return transaction;
+    }
+
+
+    async getCkbDelta() {
+        const daoType = defaultScript("DAO");
+
+        let ckbDelta = BI.from(0);
+        for (const c of this.#inputs) {
+            //Second Withdrawal step from NervosDAO
+            if (scriptEq(c.cellOutput.type, daoType) && c.data !== "0x0000000000000000") {
+                const depositHeader = await this.#getHeaderByNumber(Uint64LE.unpack(c.data).toHexString());
+                const withdrawalHeader = await this.#getHeader(c);
+                const maxWithdrawable = calculateMaximumWithdrawCompatible(c, depositHeader.dao, withdrawalHeader.dao)
+                ckbDelta = ckbDelta.add(maxWithdrawable);
+            } else {
+                ckbDelta = ckbDelta.add(c.cellOutput.capacity);
+            }
+        }
+
+        this.#outputs.forEach((c) => ckbDelta = ckbDelta.sub(c.cellOutput.capacity));
+
+        return ckbDelta;
+    }
+
+    async getIckbDelta() {
+        const daoType = defaultScript("DAO");
+        const ickbDomainLogicType = defaultScript("ICKB_DOMAIN_LOGIC");
+        const ickbSudtType = ickbSudtScript();
+
+        let ickbDelta = BI.from(0);
+        for (const c of this.#inputs) {
+            //iCKB token
+            if (scriptEq(c.cellOutput.type, ickbSudtType)) {
+                ickbDelta = ickbDelta.add(Uint128LE.unpack(c.data));
+                continue;
+            }
+
+            //Withdrawal from iCKB pool of NervosDAO deposits
+            if (scriptEq(c.cellOutput.type, daoType) &&
+                scriptEq(c.cellOutput.lock, ickbDomainLogicType) &&
+                c.data === "0x0000000000000000") {
+                const header = await this.#getHeader(c);
+                const ckbUnoccupiedCapacity = BI.from(c.cellOutput.capacity).sub(minimalCellCapacityCompatible(c));
+                ickbDelta = ickbDelta.sub(ickbValue(ckbUnoccupiedCapacity, header));
+                continue;
+            }
+
+            //iCKB Receipt
+            if (scriptEq(c.cellOutput.type, ickbDomainLogicType)) {
+                const header = await this.#getHeader(c);
+                const data = Uint64LE.unpack(c.data) // BI.from(c.data);//////////////////////////////////////////////////////////
+                const depositAmount = data.mod(DEPOSIT_AMOUNT_LIMIT);
+                const depositQuantity = data.div(DEPOSIT_AMOUNT_LIMIT);
+                ickbDelta = ickbDelta.add(receiptIckbValue(depositAmount, depositQuantity, header));
+            }
+        }
+
+        for (const c of this.#outputs) {
+            //iCKB token
+            if (scriptEq(c.cellOutput.type, ickbSudtType)) {
+                ickbDelta = ickbDelta.sub(Uint128LE.unpack(c.data));
+            }
+        }
+
+        return ickbDelta;
+    }
+
+    async #withdrawedDaoSince(c: Cell) {
+        if (!scriptEq(c.cellOutput.type, defaultScript("DAO")) || c.data === "0x0000000000000000") {
+            throw Error("Not a withdrawed dao cell")
+        }
+
+        const withdrawalHeader = await this.#getHeader(c);
+        const depositHeader = await this.#getHeaderByNumber(Uint64LE.unpack(c.data).toHexString());
+
+        return calculateDaoEarliestSinceCompatible(depositHeader.epoch, withdrawalHeader.epoch);
+    }
+
+    async #getHeader(c: Cell) {
+        if (!c.blockHash || !c.blockNumber) {
+            throw Error("Cell must have both blockHash and blockNumber populated");
+        }
+
+        this.#blockNumber2BlockHash[c.blockNumber] = c.blockHash;
+
+        return this.#getHeaderByNumber(c.blockNumber);
+    }
+
+    async #getHeaderByNumber(blockNumber: Hexadecimal) {
+        const blockHash = await this.#getBlockHash(blockNumber);
+
+        let header = this.#blockHash2Header[blockHash];
+
+        if (!header) {
+            header = await this.#rpc.getHeader(blockHash);
+            this.#blockHash2Header[blockHash] = header;
+            if (!header) {
+                throw Error("Header not found from blockHash " + blockHash);
+            }
+        }
+
+        return header;
+    }
+
+    async #getBlockHash(blockNumber: Hexadecimal) {
+        let blockHash = this.#blockNumber2BlockHash[blockNumber];
+        if (!blockHash) {
+            blockHash = await this.#rpc.getBlockHash(blockNumber);
+            this.#blockNumber2BlockHash[blockNumber] = blockHash;
+            if (!blockHash) {
+                throw Error("Block hash not found from blockNumber " + blockNumber);
+            }
+        }
+
+        return blockHash;
+    }
 }
 
-function addDefaultCellDeps(transaction: TransactionSkeletonType) {
+
+const AR_0 = BI.from("10000000000000000");
+export const ICKB_SOFT_CAP_PER_DEPOSIT = parseUnit("100000", "ckb");
+
+export function ickbValue(ckbUnoccupiedCapacity: BI, header: Header) {
+    const daoData = extractDaoDataCompatible(header.dao);
+    const AR_m = daoData["ar"];
+
+    let ickbAmount = ckbUnoccupiedCapacity.mul(AR_0).div(AR_m);
+    if (ICKB_SOFT_CAP_PER_DEPOSIT.lt(ickbAmount)) {
+        // Apply a 10% discount for the amount exceeding the soft iCKB cap per deposit.
+        ickbAmount = ickbAmount.sub(ickbAmount.sub(ICKB_SOFT_CAP_PER_DEPOSIT).div(10));
+    }
+
+    return ickbAmount;
+}
+
+export function receiptIckbValue(receiptAmount: BI, receiptCount: BI, header: Header) {
+    return ickbValue(receiptAmount, header).mul(receiptCount);
+}
+
+export function ckbSoftCapPerDeposit(header: Header) {
+    const daoData = extractDaoDataCompatible(header.dao);
+    const AR_m = daoData["ar"];
+
+    return ICKB_SOFT_CAP_PER_DEPOSIT.mul(AR_m).div(AR_0).add(1);
+}
+
+const DEPOSIT_AMOUNT_LIMIT = BI.from(2n ** (6n * 8n));
+
+function addCellDeps(transaction: TransactionSkeletonType) {
+    if (transaction.cellDeps.size !== 0) {
+        throw new Error("This function can only be used on an empty cell deps structure.");
+    }
+
     let secp256k1_blake160 = getConfig().SCRIPTS.SECP256K1_BLAKE160!;
+    if (!secp256k1_blake160) {
+        throw Error("SECP256K1_BLAKE160 not found")
+    }
 
     return transaction.update("cellDeps", (cellDeps) =>
         cellDeps.push({
@@ -181,34 +393,93 @@ function addDefaultCellDeps(transaction: TransactionSkeletonType) {
     );
 }
 
-function addDefaultWitnessPlaceholders(transaction: TransactionSkeletonType) {
-    if (transaction.witnesses.size !== 0)
-        throw new Error("This function can only be used on an empty witnesses structure.");
+async function addHeaderDeps(transaction: TransactionSkeletonType, blockNumber2BlockHash: (h: Hexadecimal) => Promise<Hexadecimal>) {
+    if (transaction.headerDeps.size !== 0) {
+        throw new Error("This function can only be used on an empty header deps structure.");
+    }
 
-    // Cycle through all inputs adding placeholders for unique locks, and empty witnesses in all other places.
-    let secp256k1_blake160 = getConfig().SCRIPTS.SECP256K1_BLAKE160!;
-    let uniqueLocks = new Set();
-    for (const input of transaction.inputs) {
-        let witness = "0x";
-
-        const lockHash = computeScriptHash(input.cellOutput.lock);
-        if (!uniqueLocks.has(lockHash)) {
-            uniqueLocks.add(lockHash);
-
-            let lock = input.cellOutput.lock;
-
-            if (lock.hashType === secp256k1_blake160.HASH_TYPE && lock.codeHash === secp256k1_blake160.CODE_HASH)
-                witness = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    const daoType = defaultScript("DAO");
+    const ickbDomainLogicType = defaultScript("ICKB_DOMAIN_LOGIC");
+    const uniqueBlockHashes: Set<string> = new Set();
+    for (const c of transaction.inputs) {
+        if (!c.blockHash || !c.blockNumber) {
+            throw Error("Cell must have both blockHash and blockNumber populated");
         }
 
-        witness = bytes.hexify(blockchain.WitnessArgs.pack({ lock: witness }));
-        transaction = transaction.update("witnesses", (w) => w.push(witness));
+        if (scriptEq(c.cellOutput.type, daoType)) {
+            uniqueBlockHashes.add(c.blockHash);
+            if (c.data !== "0x0000000000000000") {
+                uniqueBlockHashes.add(await blockNumber2BlockHash(Uint64LE.unpack(c.data).toHexString()));
+            }
+            continue;
+        }
+
+        if (scriptEq(c.cellOutput.type, ickbDomainLogicType)) {
+            uniqueBlockHashes.add(c.blockHash);
+        }
+    }
+
+    transaction = transaction.update("headerDeps", (h) => h.push(...uniqueBlockHashes.keys()));
+
+    return transaction;
+}
+
+async function addInputSinces(transaction: TransactionSkeletonType, withdrawedDaoSince: (c: Cell) => Promise<BI>) {
+    if (transaction.inputSinces.size !== 0) {
+        throw new Error("This function can only be used on an empty input sinces structure.");
+    }
+
+    const daoType = defaultScript("DAO");
+    for (const [index, c] of transaction.inputs.entries()) {
+        if (scriptEq(c.cellOutput.type, daoType) && c.data !== "0x0000000000000000") {
+            const since = await withdrawedDaoSince(c);
+            transaction = transaction.update("inputSinces", (inputSinces) => {
+                return inputSinces.set(index, since.toHexString());
+            });
+        }
     }
 
     return transaction;
 }
 
-function signTransaction(transaction: TransactionSkeletonType, PRIVATE_KEY: string) {
+async function addWitnessPlaceholders(transaction: TransactionSkeletonType, blockNumber2BlockHash: (h: Hexadecimal) => Promise<Hexadecimal>) {
+    if (transaction.witnesses.size !== 0) {
+        throw new Error("This function can only be used on an empty witnesses structure.");
+    }
+
+    const daoType = defaultScript("DAO");
+    const secp256k1Blake160Lock = defaultScript("SECP256K1_BLAKE160");
+    const uniqueLocks: Set<string> = new Set();
+    for (const c of transaction.inputs) {
+        const witnessArgs: WitnessArgs = { lock: "0x" };
+
+        const lockHash = computeScriptHash(c.cellOutput.lock);
+        if (!uniqueLocks.has(lockHash)) {
+            uniqueLocks.add(lockHash);
+
+            if (c.cellOutput.lock.codeHash == secp256k1Blake160Lock.codeHash &&
+                c.cellOutput.lock.hashType == secp256k1Blake160Lock.hashType) {
+                witnessArgs.lock = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+            }
+        }
+
+        if (scriptEq(c.cellOutput.type, daoType) && c.data !== "0x0000000000000000") {
+            const blockHash = await blockNumber2BlockHash(Uint64LE.unpack(c.data).toHexString());
+            const headerDepIndex = transaction.headerDeps.findIndex((v) => v == blockHash);
+            if (headerDepIndex === -1) {
+                throw Error("Block hash not found in Header Dependencies")
+            }
+            witnessArgs.inputType = bytes.hexify(Uint64LE.pack(headerDepIndex));
+        }
+
+        const packedWitness = bytes.hexify(blockchain.WitnessArgs.pack(witnessArgs));
+        transaction = transaction.update("witnesses", (w) => w.push(packedWitness));
+    }
+
+    return transaction;
+}
+
+export function signTransaction(transaction: TransactionSkeletonType, PRIVATE_KEY: string) {
     transaction = secp256k1Blake160.prepareSigningEntries(transaction);
     const message = transaction.get("signingEntries").get(0)?.message;
     const Sig = key.signRecoverable(message!, PRIVATE_KEY);
@@ -217,10 +488,7 @@ function signTransaction(transaction: TransactionSkeletonType, PRIVATE_KEY: stri
     return tx;
 }
 
-async function sendTransaction(signedTransaction: Transaction) {
-    // Initialize an RPC instance.
-    const rpc = new RPC(INDEXER_URL, { timeout: 10000 });
-
+export async function sendTransaction(signedTransaction: Transaction, rpc: RPC) {
     //Send the transaction
     const txHash = await rpc.sendTransaction(signedTransaction);
 
@@ -240,58 +508,4 @@ async function sendTransaction(signedTransaction: Transaction) {
     }
 
     throw new Error("Transaction timed out.");
-}
-
-export async function execTx(transaction: TransactionSkeletonType, account: Account) {
-    // Add Capacity
-    transaction = await addCapacity(transaction, account);
-
-    // Add default Deps
-    transaction = addDefaultCellDeps(transaction);
-
-    // Retrieve Output Cells Role Tags
-    let roleTags: string[] = [];
-    ({ transaction, roleTags } = popRoleTags(transaction));
-
-    // Add in the witness placeholders.
-    transaction = addDefaultWitnessPlaceholders(transaction);
-
-    // Sign transaction
-    const signedTransaction = signTransaction(transaction, account.privKey);
-
-    // Print the details of the transaction to the console.
-    // console.log(JSON.stringify(signedTransaction, undefined, 2));
-
-    // Send transaction
-    const txHash = await sendTransaction(signedTransaction);
-
-    // Transform role tags into a map of the outpoints
-    const roleTag2OutPoints: { [id: string]: OutPoint[]; } = {};
-    roleTags.forEach((roleTag, i) => {
-        const index = BI.from(i).toHexString();
-        roleTag2OutPoints[roleTag] = [...roleTag2OutPoints[roleTag] || [], { txHash, index }]
-    });
-
-    return roleTag2OutPoints;
-}
-
-export async function readFileToHexString(filename: PathOrFileDescriptor) {
-    const data = await readFile(filename);
-    const dataSize = data.length;
-    const hexString = "0x" + data.toString("hex");
-
-    return { hexString, dataSize };
-}
-
-export async function getLiveCell(rpc: RPC, outPoint: OutPoint) {
-    const res = await rpc.getLiveCell(outPoint, true);
-
-    if (res.status !== "live")
-        throw new Error(`Live cell not found at out point: ${outPoint.txHash}-${outPoint.index}`);
-
-    return <Cell>{
-        cellOutput: res.cell.output,
-        outPoint,
-        data: res.cell.data.content
-    }
 }

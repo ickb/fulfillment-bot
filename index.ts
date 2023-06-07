@@ -1,71 +1,142 @@
-import { Account, randomSecp256k1Account } from "./utils";
-import { parseUnit } from "@ckb-lumos/bi"
-import { TransactionSkeleton, TransactionSkeletonType } from "@ckb-lumos/helpers";
-import { initializeConfig } from "@ckb-lumos/config-manager/lib";
-import { Cell } from "@ckb-lumos/base";
-import { INDEXER_URL, addOutputs, execTx, localConfig } from "./lib";
-import { createDepGroup, deployCode, updatedLocalConfig } from "./deploy_scripts";
-import { ckb_soft_cap_per_deposit, depositPhaseOne, depositPhaseTwo } from "./ickb_domain_logic";
+import { Account, randomSecp256k1Account } from "./account";
+import { parseUnit, BI } from "@ckb-lumos/bi"
+import { TransactionBuilder, sendTransaction, signTransaction } from "./lib";
+import { createDepGroup, defaultScript, deployCode, getIndexer, getNodeUrl, getRPC, initNodeUrl, scriptEq, setConfig } from "./utils";
+import { ckbSoftCapPerDeposit } from "./lib";
 import { RPC } from "@ckb-lumos/rpc";
+import { Cell, Transaction } from "@ckb-lumos/base";
+import { CellCollector } from "@ckb-lumos/ckb-indexer";
+import { TransactionSkeleton } from "@ckb-lumos/helpers";
+
 
 async function main() {
+    initNodeUrl("http://127.0.0.1:8114/");
+    const rpc = getRPC();
+
     console.log("Initializing Config with devnet data");
-    initializeConfig(await localConfig());
+    await setConfig();
     console.log("✓");
 
     // Genesis account.
     let genesisAccount = randomSecp256k1Account("0xd00c06bfd800d27397002dca6fb0993d5ba6399b4238b2f29ee9deb97593d2bc");
 
     console.log("Creating new test account:");
-    let account = randomSecp256k1Account();
+    const account = randomSecp256k1Account();
     console.log(account)
     console.log("✓");
 
     console.log("Funding test account");
-    const _ = await execTx(fundAccount(account), genesisAccount)
-    console.log("✓");
+    const fundAccountTxHash = await fundAccount(genesisAccount, account);
+    console.log(fundAccountTxHash + " ✓");
 
-    console.log("Deploying iCKB code");
-    const dataFiles = ["./files/sudt", "./files/ickb_domain_logic", "./files/ckb_sudt_limit_order"];
-    const deployCodeOutpoints = await execTx(await deployCode(dataFiles), account)
-    console.log("✓");
+    console.log("Deploying iCKB code and updating Config");
+    const deployCodeTxHash = await deployCode(account);
+    console.log(deployCodeTxHash + " ✓");
 
-    console.log("Creating iCKB DepGroup");
-    const depGroupOutpoints = await execTx(await createDepGroup(deployCodeOutpoints["code"]), account);
-    console.log("✓");
-
-    console.log("Updating Config with iCKB DepGroup");
-    initializeConfig(await updatedLocalConfig(dataFiles, depGroupOutpoints["depGroup"][0]));
-    console.log("✓");
+    console.log("Creating iCKB DepGroup and updating Config");
+    const depGroupTxHash = await createDepGroup(account);
+    console.log(depGroupTxHash + " ✓");
 
     console.log("Creating a deposit phase one");
-    const header = await new RPC(INDEXER_URL, { timeout: 10000 }).getTipHeader();
-    const depositPhaseOneOutpoints = await execTx(await depositPhaseOne(ckb_soft_cap_per_deposit(header), 61, account), account);
-    console.log("✓");
+    const header = await rpc.getTipHeader();
+    const d1TxHash = await deposit1(account, ckbSoftCapPerDeposit(header), 61);
+    console.log(d1TxHash + " ✓");
 
     console.log("Creating a deposit phase two");
-    const depositPhaseTwoOutpoints = await execTx(await depositPhaseTwo(depositPhaseOneOutpoints["receipt"], depositPhaseOneOutpoints["ownerLock"][0]), account);
-    console.log("✓");
+    const d2TxHash = await deposit2(account);
+    console.log(d2TxHash + " ✓");
 
-    console.log("iCKB SUDT token at: ", depositPhaseTwoOutpoints["ickbSudt"]);
+    console.log("Creating a withdrawal phase one");
+    const w1TxHash = await withdraw1(account);
+    console.log(w1TxHash + " ✓");
+
+    console.log("Creating a withdrawal phase two");
+    const w2TxHash = await withdraw2(account);
+    console.log(w2TxHash + " ✓");
+
+    // console.log("iCKB SUDT token at: ", depositPhaseTwoOutpoints["ickbSudt"]);
 }
 
-function fundAccount(account: Account, transaction_?: TransactionSkeletonType) {
-    let transaction = transaction_ ?? TransactionSkeleton();
 
-    // Create cells for the funding address.
-    const output1: Cell = {
+
+async function deposit1(account: Account, depositAmount: BI, depositQuantity: number) {
+    const transaction = await (await new TransactionBuilder(account.lockScript).fund()).deposit(depositAmount, depositQuantity).build();
+    const signedTransaction = signTransaction(transaction, account.privKey);
+    const txHash = await sendTransaction(signedTransaction, getRPC());
+    return txHash;
+}
+
+async function deposit2(account: Account) {
+    let transaction = await (await new TransactionBuilder(account.lockScript).fund()).build();
+    const signedTransaction = signTransaction(transaction, account.privKey);
+    const txHash = await sendTransaction(signedTransaction, getRPC());
+    return txHash;
+}
+
+async function withdraw1(account: Account) {
+    //Withdraw from all deposit just for demonstration purposes
+    const indexer = getIndexer();
+    await indexer.waitForSync();
+    let deposits: Cell[] = [];
+    const collector = new CellCollector(indexer, {
+        scriptSearchMode: "exact",
+        withData: true,
+        lock: defaultScript("ICKB_DOMAIN_LOGIC"),
+        type: defaultScript("DAO"),
+    }, {
+        withBlockHash: true,
+        ckbRpcUrl: getNodeUrl()
+    });
+    for await (const cell of collector.collect()) {
+        if (cell.data === "0x0000000000000000") {
+            deposits.push(cell);
+        }
+    }
+
+    if (deposits.length == 0) {
+        throw Error("Deposits not found");
+    }
+
+    const transaction = await (await new TransactionBuilder(account.lockScript).fund()).withdrawFrom(...deposits).build();
+    const signedTransaction = signTransaction(transaction, account.privKey);
+    const txHash = await sendTransaction(signedTransaction, getRPC());
+    return txHash;
+}
+
+
+async function withdraw2(account: Account) {
+    const buildWithdrawal2 = async () => await (await new TransactionBuilder(account.lockScript).fund()).build();
+
+    let transaction = TransactionSkeleton();
+
+    while (!transaction.inputs.some(
+        (c) => scriptEq(c.cellOutput.lock, account.lockScript) &&
+            scriptEq(c.cellOutput.type, defaultScript("DAO")) &&
+            c.data !== "0x0000000000000000"
+    )) {
+        console.log("Waiting...")
+        await new Promise(r => setTimeout(r, 10000));
+        transaction = await buildWithdrawal2();
+    }
+
+    const signedTransaction = signTransaction(transaction, account.privKey);
+    const txHash = await sendTransaction(signedTransaction, getRPC());
+    return txHash;
+}
+
+async function fundAccount(fromAccount: Account, toAccount: Account) {
+    let cell = {
         cellOutput: {
-            capacity: parseUnit("100000", "ckb").toHexString(),
-            lock: account.lockScript,
+            capacity: parseUnit("10000000", "ckb").toHexString(),
+            lock: toAccount.lockScript,
             type: undefined
         },
         data: "0x"
-    };
-
-    transaction = addOutputs(transaction, "funding", ...Array.from({ length: 100 }, () => output1));
-
-    return transaction
+    }
+    const transaction = await (await new TransactionBuilder(fromAccount.lockScript).fund()).add("output", "start", cell).build();
+    const signedTransaction = signTransaction(transaction, fromAccount.privKey);
+    const txHash = await sendTransaction(signedTransaction, getRPC());
+    return txHash;
 }
 
 main();
