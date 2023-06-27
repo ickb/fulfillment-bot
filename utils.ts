@@ -1,13 +1,13 @@
 import { Account } from "./account";
-import { TransactionBuilder, sendTransaction, signTransaction } from "./lib";
+import { TransactionBuilder } from "./lib";
 
 import { RPC } from "@ckb-lumos/rpc";
 import { BI, BIish, parseUnit } from "@ckb-lumos/bi"
-import { Config, ScriptConfig, ScriptConfigs, getConfig, initializeConfig, } from "@ckb-lumos/config-manager/lib";
+import { ScriptConfigs, getConfig, initializeConfig, } from "@ckb-lumos/config-manager/lib";
 import { molecule } from "@ckb-lumos/codec";
 import { ckbHash } from "@ckb-lumos/base/lib/utils";
 import { computeScriptHash } from "@ckb-lumos/base/lib/utils";
-import { Cell, Hexadecimal, OutPoint, Script, blockchain } from "@ckb-lumos/base";
+import { Cell, Hexadecimal, OutPoint, Script, Transaction, blockchain } from "@ckb-lumos/base";
 import { readFile, readdir } from "fs/promises";
 import { PathLike } from "fs";
 import { Indexer } from "@ckb-lumos/ckb-indexer";
@@ -63,6 +63,20 @@ export async function readFileToHexString(filename: PathLike) {
     const hexString = "0x" + data.toString("hex");
 
     return { hexString, dataSize };
+}
+
+export function calculateFee(transaction: Transaction, feeRate: BIish): BI {
+    const serializedTx = blockchain.Transaction.pack(transaction);
+    // 4 is serialized offset bytesize;
+    const size = serializedTx.byteLength + 4;
+
+    const ratio = BI.from(1000);
+    const base = BI.from(size).mul(feeRate);
+    const fee = base.div(ratio);
+    if (fee.mul(ratio).lt(base)) {
+        return fee.add(1);
+    }
+    return fee;
 }
 
 export function defaultScript(name: string): Script {
@@ -122,9 +136,7 @@ export async function deployCode(account: Account) {
         cells.push(output1);
     }
 
-    const transaction = await (await new TransactionBuilder(account.lockScript).fund()).add("output", "start", ...cells).build();
-    const signedTransaction = signTransaction(transaction, account.privKey);
-    const txHash = await sendTransaction(signedTransaction, getRPC());
+    const { txHash } = await (await new TransactionBuilder(account).fund()).add("output", "start", ...cells).buildAndSend();
 
     const name2PartialScriptConfig: { [id: string]: PartialScriptConfig | undefined } = {};
     for (const scriptName of await getLocalScriptNames()) {
@@ -176,9 +188,7 @@ export async function createDepGroup(account: Account) {
         data: hexOutPoints
     };
 
-    const transaction = await (await new TransactionBuilder(account.lockScript).fund()).add("output", "start", cell).build();
-    const signedTransaction = signTransaction(transaction, account.privKey);
-    const txHash = await sendTransaction(signedTransaction, getRPC());
+    const { txHash } = await (await new TransactionBuilder(account).fund()).add("output", "start", cell).buildAndSend();
 
     const name2PartialScriptConfig: { [id: string]: PartialScriptConfig | undefined } = {};
     for (const scriptName of Object.getOwnPropertyNames(config.SCRIPTS)) {
@@ -227,8 +237,8 @@ export async function setConfig(name2PartialScriptConfig: {
         scriptConfigs[scriptName.toUpperCase()] = {
             CODE_HASH: ckbHash(await readFile(BINARIES_FILEPATH + scriptName)),
             HASH_TYPE: "data",
-            TX_HASH: genesisBlock.transactions[0].hash!,
-            INDEX: "0x42",
+            TX_HASH: genesisBlock.transactions[0].hash!,//Dummy value
+            INDEX: "0x42",//Dummy value
             DEP_TYPE: "code",
             ...name2PartialScriptConfig[scriptName.toUpperCase()],
         };
@@ -239,5 +249,6 @@ export async function setConfig(name2PartialScriptConfig: {
         SCRIPTS: scriptConfigs
     });
 
+    // console.log("Config initialized to:");
     // console.log(getConfig());
 }

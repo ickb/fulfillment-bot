@@ -49,7 +49,7 @@ genesis_epoch_length = 2 # instead of 1000
 permanent_difficulty_in_dummy = true
 ```
 
-5. In the `miner-ckb.toml` file under the `[[miner.workers]]` section set:
+5. In the `ckb-miner.toml` file under the `[[miner.workers]]` section set:
 
 ``` toml
 [[miner.workers]]

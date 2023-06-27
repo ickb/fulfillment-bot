@@ -1,12 +1,10 @@
 import { Account, randomSecp256k1Account } from "./account";
 import { parseUnit, BI } from "@ckb-lumos/bi"
-import { TransactionBuilder, sendTransaction, signTransaction } from "./lib";
+import { TransactionBuilder } from "./lib";
 import { createDepGroup, defaultScript, deployCode, getIndexer, getNodeUrl, getRPC, initNodeUrl, scriptEq, setConfig } from "./utils";
 import { ckbSoftCapPerDeposit } from "./lib";
-import { RPC } from "@ckb-lumos/rpc";
-import { Cell, Transaction } from "@ckb-lumos/base";
+import { Cell } from "@ckb-lumos/base";
 import { CellCollector } from "@ckb-lumos/ckb-indexer";
-import { TransactionSkeleton } from "@ckb-lumos/helpers";
 
 
 async function main() {
@@ -57,19 +55,13 @@ async function main() {
     // console.log("iCKB SUDT token at: ", depositPhaseTwoOutpoints["ickbSudt"]);
 }
 
-
-
 async function deposit1(account: Account, depositAmount: BI, depositQuantity: number) {
-    const transaction = await (await new TransactionBuilder(account.lockScript).fund()).deposit(depositAmount, depositQuantity).build();
-    const signedTransaction = signTransaction(transaction, account.privKey);
-    const txHash = await sendTransaction(signedTransaction, getRPC());
+    const { txHash } = await (await new TransactionBuilder(account).fund()).deposit(depositAmount, depositQuantity).buildAndSend();
     return txHash;
 }
 
 async function deposit2(account: Account) {
-    let transaction = await (await new TransactionBuilder(account.lockScript).fund()).build();
-    const signedTransaction = signTransaction(transaction, account.privKey);
-    const txHash = await sendTransaction(signedTransaction, getRPC());
+    let { txHash } = await (await new TransactionBuilder(account).fund()).buildAndSend();
     return txHash;
 }
 
@@ -97,30 +89,22 @@ async function withdraw1(account: Account) {
         throw Error("Deposits not found");
     }
 
-    const transaction = await (await new TransactionBuilder(account.lockScript).fund()).withdrawFrom(...deposits).build();
-    const signedTransaction = signTransaction(transaction, account.privKey);
-    const txHash = await sendTransaction(signedTransaction, getRPC());
+    const { txHash } = await (await new TransactionBuilder(account).fund()).withdrawFrom(...deposits).buildAndSend();
     return txHash;
 }
 
-
 async function withdraw2(account: Account) {
-    const buildWithdrawal2 = async () => await (await new TransactionBuilder(account.lockScript).fund()).build();
+    const buildWithdrawal2 = async () => await new TransactionBuilder(account).fund();
 
-    let transaction = TransactionSkeleton();
+    let transactionBuilder = await buildWithdrawal2();
 
-    while (!transaction.inputs.some(
-        (c) => scriptEq(c.cellOutput.lock, account.lockScript) &&
-            scriptEq(c.cellOutput.type, defaultScript("DAO")) &&
-            c.data !== "0x0000000000000000"
-    )) {
+    while (!transactionBuilder.hasWithdrawalPhase2()) {
         console.log("Waiting...")
         await new Promise(r => setTimeout(r, 10000));
-        transaction = await buildWithdrawal2();
+        transactionBuilder = await buildWithdrawal2();
     }
 
-    const signedTransaction = signTransaction(transaction, account.privKey);
-    const txHash = await sendTransaction(signedTransaction, getRPC());
+    const { txHash } = await transactionBuilder.buildAndSend();
     return txHash;
 }
 
@@ -133,9 +117,7 @@ async function fundAccount(fromAccount: Account, toAccount: Account) {
         },
         data: "0x"
     }
-    const transaction = await (await new TransactionBuilder(fromAccount.lockScript).fund()).add("output", "start", cell).build();
-    const signedTransaction = signTransaction(transaction, fromAccount.privKey);
-    const txHash = await sendTransaction(signedTransaction, getRPC());
+    const { txHash } = await (await new TransactionBuilder(fromAccount).fund()).add("output", "start", cell).buildAndSend();
     return txHash;
 }
 

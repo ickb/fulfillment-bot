@@ -1,6 +1,6 @@
 
 import { Account } from "./account";
-import { defaultScript, getIndexer, getNodeUrl, getRPC, ickbSudtScript, parseEpoch, scriptEq } from "./utils";
+import { calculateFee, defaultScript, getIndexer, getNodeUrl, getRPC, ickbSudtScript, parseEpoch, scriptEq } from "./utils";
 import { secp256k1Blake160 } from "@ckb-lumos/common-scripts";
 import { RPC } from "@ckb-lumos/rpc";
 import { BI, parseUnit } from "@ckb-lumos/bi"
@@ -9,7 +9,7 @@ import { key } from "@ckb-lumos/hd";
 import { getConfig } from "@ckb-lumos/config-manager/lib";
 import { computeScriptHash } from "@ckb-lumos/base/lib/utils";
 import { bytes } from "@ckb-lumos/codec";
-import { Cell, Header, Hexadecimal, Script, Transaction, WitnessArgs, blockchain } from "@ckb-lumos/base";
+import { Cell, Header, HexString, Hexadecimal, Script, Transaction, WitnessArgs, blockchain } from "@ckb-lumos/base";
 import { CellCollector, Indexer } from "@ckb-lumos/ckb-indexer";
 import { CKBIndexerQueryOptions } from "@ckb-lumos/ckb-indexer/lib/type";
 import { calculateDaoEarliestSinceCompatible, calculateMaximumWithdrawCompatible, extractDaoDataCompatible } from "@ckb-lumos/common-scripts/lib/dao";
@@ -17,7 +17,7 @@ import { Uint128LE, Uint64LE } from "@ckb-lumos/codec/lib/number/uint";
 import { hexify } from "@ckb-lumos/codec/lib/bytes";
 
 export class TransactionBuilder {
-    #accountLockScript: Script;
+    #account: Account;
 
     #indexer: Indexer;
     #rpc: RPC;
@@ -27,8 +27,8 @@ export class TransactionBuilder {
     #inputs: Cell[];
     #outputs: Cell[];
 
-    constructor(accountLockScript: Script) {
-        this.#accountLockScript = accountLockScript;
+    constructor(account: Account) {
+        this.#account = account;
 
         this.#indexer = getIndexer();
         this.#rpc = getRPC();
@@ -92,7 +92,7 @@ export class TransactionBuilder {
         const collector = new CellCollector(this.#indexer, {
             scriptSearchMode: "exact",
             withData: true,
-            lock: this.#accountLockScript,
+            lock: this.#account.lockScript,
             ...query
         }, {
             withBlockHash: true,
@@ -150,7 +150,7 @@ export class TransactionBuilder {
         const receipt = {
             cellOutput: {
                 capacity: parseUnit("102", "ckb").toHexString(),
-                lock: this.#accountLockScript,
+                lock: this.#account.lockScript,
                 type: defaultScript("ICKB_DOMAIN_LOGIC")
             },
             // depositQuantity deposits of depositAmount + occupied capacity.
@@ -168,7 +168,7 @@ export class TransactionBuilder {
             const withdrawal = {
                 cellOutput: {
                     capacity: deposit.cellOutput.capacity,
-                    lock: this.#accountLockScript,
+                    lock: this.#account.lockScript,
                     type: dao
                 },
                 data: hexify(Uint64LE.pack(BI.from(deposit.blockNumber)))
@@ -179,8 +179,34 @@ export class TransactionBuilder {
         return this.add("input", "start", ...deposits).add("output", "start", ...withdrawals);
     }
 
-    async build(fee: BI = BI.from("200000")) {
-        const ckbDelta = (await this.getCkbDelta()).sub(fee);
+    hasWithdrawalPhase2() {
+        const daoType = defaultScript("DAO");
+
+        for (const c of this.#inputs) {
+            //Second Withdrawal step from NervosDAO
+            if (scriptEq(c.cellOutput.type, daoType) && c.data !== "0x0000000000000000") {
+                return true;
+            }
+        }
+
+        return false
+    }
+
+    async buildAndSend(feeRate: BI = BI.from(1000)) {
+        const ckbDelta = await this.getCkbDelta();
+        const fee = calculateFee((await this.#buildWithChange(ckbDelta)).signedTransaction, feeRate);
+
+        // console.log("Fee of " + fee.toString() + " Shannons");
+
+        const { transaction, signedTransaction } = await this.#buildWithChange(ckbDelta.sub(fee));
+
+
+        const txHash = await sendTransaction(signedTransaction, this.#rpc);
+
+        return { transaction, fee, signedTransaction, txHash }
+    }
+
+    async #buildWithChange(ckbDelta: BI) {
         const ickbDelta = await this.getIckbDelta();
 
         const changeCells: Cell[] = [];
@@ -190,7 +216,7 @@ export class TransactionBuilder {
             changeCells.push({
                 cellOutput: {
                     capacity: ckbDelta.toHexString(),
-                    lock: this.#accountLockScript,
+                    lock: this.#account.lockScript,
                     type: undefined,
                 },
                 data: "0x"
@@ -199,7 +225,7 @@ export class TransactionBuilder {
             changeCells.push({
                 cellOutput: {
                     capacity: ckbDelta.toHexString(),
-                    lock: this.#accountLockScript,
+                    lock: this.#account.lockScript,
                     type: ickbSudtScript()
                 },
                 data: hexify(Uint128LE.pack(ickbDelta))
@@ -220,12 +246,10 @@ export class TransactionBuilder {
 
         transaction = await addWitnessPlaceholders(transaction, async (blockNumber: string) => this.#getBlockHash(blockNumber));
 
-        // Print the details of the transaction to the console.
-        // console.log(JSON.stringify(transaction, undefined, 2));
+        const signedTransaction = signTransaction(transaction, this.#account.privKey);
 
-        return transaction;
+        return { transaction, signedTransaction };
     }
-
 
     async getCkbDelta() {
         const daoType = defaultScript("DAO");
@@ -479,7 +503,7 @@ async function addWitnessPlaceholders(transaction: TransactionSkeletonType, bloc
     return transaction;
 }
 
-export function signTransaction(transaction: TransactionSkeletonType, PRIVATE_KEY: string) {
+function signTransaction(transaction: TransactionSkeletonType, PRIVATE_KEY: string) {
     transaction = secp256k1Blake160.prepareSigningEntries(transaction);
     const message = transaction.get("signingEntries").get(0)?.message;
     const Sig = key.signRecoverable(message!, PRIVATE_KEY);
@@ -488,7 +512,7 @@ export function signTransaction(transaction: TransactionSkeletonType, PRIVATE_KE
     return tx;
 }
 
-export async function sendTransaction(signedTransaction: Transaction, rpc: RPC) {
+async function sendTransaction(signedTransaction: Transaction, rpc: RPC) {
     //Send the transaction
     const txHash = await rpc.sendTransaction(signedTransaction);
 
