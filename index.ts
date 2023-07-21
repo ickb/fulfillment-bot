@@ -37,7 +37,7 @@ async function main() {
 
     console.log("Creating a deposit phase one");
     const header = await rpc.getTipHeader();
-    const d1TxHash = await deposit1(account, ckbSoftCapPerDeposit(header), 61);
+    const d1TxHash = await deposit1(account, ckbSoftCapPerDeposit(header), BI.from(61));
     console.log(d1TxHash + " ✓");
 
     console.log("Creating a deposit phase two");
@@ -55,7 +55,7 @@ async function main() {
     // console.log("iCKB SUDT token at: ", depositPhaseTwoOutpoints["ickbSudt"]);
 }
 
-async function deposit1(account: Account, depositAmount: BI, depositQuantity: number) {
+async function deposit1(account: Account, depositAmount: BI, depositQuantity: BI) {
     const { txHash } = await (await new TransactionBuilder(account).fund()).deposit(depositAmount, depositQuantity).buildAndSend();
     return txHash;
 }

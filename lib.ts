@@ -1,6 +1,6 @@
 
 import { Account } from "./account";
-import { calculateFee, defaultScript, getIndexer, getNodeUrl, getRPC, ickbSudtScript, parseEpoch, scriptEq } from "./utils";
+import { DEPOSIT_AMOUNT_LIMIT, calculateFee, defaultScript, getIndexer, getNodeUrl, getRPC, ickbSudtScript, parseEpoch, ReceiptCodec, scriptEq } from "./utils";
 import { secp256k1Blake160 } from "@ckb-lumos/common-scripts";
 import { RPC } from "@ckb-lumos/rpc";
 import { BI, parseUnit } from "@ckb-lumos/bi"
@@ -127,12 +127,12 @@ export class TransactionBuilder {
         return this;
     }
 
-    deposit(depositAmount: BI, depositQuantity: number) {
+    deposit(depositAmount: BI, depositQuantity: BI) {
         if (depositAmount.gte(DEPOSIT_AMOUNT_LIMIT)) {
             throw Error(`depositAmount is ${depositAmount}, but should be less than ${DEPOSIT_AMOUNT_LIMIT.toString()}`);
         }
 
-        if (depositQuantity > 61) {
+        if (depositQuantity.gt(61)) {
             throw Error(`depositQuantity is ${depositQuantity}, but should be less than 62`);
         }
 
@@ -153,12 +153,11 @@ export class TransactionBuilder {
                 lock: this.#account.lockScript,
                 type: defaultScript("ICKB_DOMAIN_LOGIC")
             },
-            // depositQuantity deposits of depositAmount + occupied capacity.
-            // (( 2n ** (6n * 8n)) * depositQuantity) + depositAmount
-            data: hexify(Uint64LE.pack(DEPOSIT_AMOUNT_LIMIT.mul(depositQuantity).add(depositAmount)))//modify script?///////
+
+            data: ReceiptCodec.pack({ depositAmount, depositQuantity })
         };
 
-        return this.add("output", "end", ...Array.from({ length: depositQuantity }, () => deposit), receipt);
+        return this.add("output", "end", ...Array.from({ length: depositQuantity.toNumber() }, () => deposit), receipt);
     }
 
     withdrawFrom(...deposits: Cell[]) {
@@ -196,10 +195,7 @@ export class TransactionBuilder {
         const ckbDelta = await this.getCkbDelta();
         const fee = calculateFee((await this.#buildWithChange(ckbDelta)).signedTransaction, feeRate);
 
-        // console.log("Fee of " + fee.toString() + " Shannons");
-
         const { transaction, signedTransaction } = await this.#buildWithChange(ckbDelta.sub(fee));
-
 
         const txHash = await sendTransaction(signedTransaction, this.#rpc);
 
@@ -298,9 +294,7 @@ export class TransactionBuilder {
             //iCKB Receipt
             if (scriptEq(c.cellOutput.type, ickbDomainLogicType)) {
                 const header = await this.#getHeader(c);
-                const data = Uint64LE.unpack(c.data) // BI.from(c.data);//////////////////////////////////////////////////////////
-                const depositAmount = data.mod(DEPOSIT_AMOUNT_LIMIT);
-                const depositQuantity = data.div(DEPOSIT_AMOUNT_LIMIT);
+                const { depositAmount, depositQuantity } = ReceiptCodec.unpack(c.data);
                 ickbDelta = ickbDelta.add(receiptIckbValue(depositAmount, depositQuantity, header));
             }
         }
@@ -366,7 +360,6 @@ export class TransactionBuilder {
     }
 }
 
-
 const AR_0 = BI.from("10000000000000000");
 export const ICKB_SOFT_CAP_PER_DEPOSIT = parseUnit("100000", "ckb");
 
@@ -393,8 +386,6 @@ export function ckbSoftCapPerDeposit(header: Header) {
 
     return ICKB_SOFT_CAP_PER_DEPOSIT.mul(AR_m).div(AR_0).add(1);
 }
-
-const DEPOSIT_AMOUNT_LIMIT = BI.from(2n ** (6n * 8n));
 
 function addCellDeps(transaction: TransactionSkeletonType) {
     if (transaction.cellDeps.size !== 0) {

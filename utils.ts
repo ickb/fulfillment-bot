@@ -11,6 +11,12 @@ import { Cell, Hexadecimal, OutPoint, Script, Transaction, blockchain } from "@c
 import { readFile, readdir } from "fs/promises";
 import { PathLike } from "fs";
 import { Indexer } from "@ckb-lumos/ckb-indexer";
+import { hexify } from "@ckb-lumos/codec/lib/bytes";
+import { struct } from "@ckb-lumos/codec/lib/molecule/layout";
+import { Uint64, Uint8 } from "@ckb-lumos/codec/lib/number";
+import { Byte32, HashType as HashTypeCodec, createFixedHexBytesCodec } from "@ckb-lumos/base/lib/blockchain";
+import { BytesLike } from "@ckb-lumos/codec/lib/base";
+import { HashType, HexString } from "@ckb-lumos/base";
 
 let _nodeUrl: string | undefined;
 
@@ -252,3 +258,61 @@ export async function setConfig(name2PartialScriptConfig: {
     // console.log("Config initialized to:");
     // console.log(getConfig());
 }
+
+export const DEPOSIT_AMOUNT_LIMIT = BI.from(2n ** (6n * 8n));
+
+export const ReceiptCodec = {
+    pack: (fields: { depositAmount: BI, depositQuantity: BI }) => {
+        return hexify(Uint64.pack(DEPOSIT_AMOUNT_LIMIT.mul(fields.depositQuantity).add(fields.depositAmount)));
+    },
+    unpack: (packedData: Hexadecimal) => {
+        const data = Uint64.unpack(packedData)
+        const depositAmount = data.mod(DEPOSIT_AMOUNT_LIMIT);
+        const depositQuantity = data.div(DEPOSIT_AMOUNT_LIMIT);
+
+        return { depositAmount, depositQuantity };
+    },
+};
+
+const createParametricLimitOrderCodec = (argsLength: number) => {
+    const ParametricScriptCodec = struct(
+        {
+            codeHash: Byte32,
+            hashType: HashTypeCodec,
+            args: createFixedHexBytesCodec(argsLength),
+        },
+        ["codeHash", "hashType", "args"]
+    );
+
+    return struct(
+        {
+            sudtHash: Byte32,
+            isSudtToCkb: Uint8,
+            sudtMultiplier: Uint64,
+            ckbMultiplier: Uint64,
+            terminalLock: ParametricScriptCodec,
+        },
+        ["sudtHash", "isSudtToCkb", "sudtMultiplier", "ckbMultiplier", "terminalLock"]
+    );
+}
+
+interface LimitOrderFields {
+    sudtHash: BytesLike,
+    isSudtToCkb: BIish,
+    sudtMultiplier: BIish,
+    ckbMultiplier: BIish,
+    terminalLock: {
+        codeHash: BytesLike,
+        hashType: HashType,
+        args: HexString
+    }
+}
+
+const minLimitOrderLength = createParametricLimitOrderCodec(0).byteLength;
+
+export const LimitOrderCodec = {
+    pack: (fields: LimitOrderFields) =>
+        createParametricLimitOrderCodec((fields.terminalLock.args.length - 2) / 2).pack(fields),
+    unpack: (data: Uint8Array) =>
+        createParametricLimitOrderCodec(data.length - minLimitOrderLength).unpack(data),
+};
