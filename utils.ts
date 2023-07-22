@@ -4,19 +4,17 @@ import { TransactionBuilder } from "./lib";
 import { RPC } from "@ckb-lumos/rpc";
 import { BI, BIish, parseUnit } from "@ckb-lumos/bi"
 import { ScriptConfigs, getConfig, initializeConfig, } from "@ckb-lumos/config-manager/lib";
-import { molecule } from "@ckb-lumos/codec";
-import { ckbHash } from "@ckb-lumos/base/lib/utils";
-import { computeScriptHash } from "@ckb-lumos/base/lib/utils";
+import { ckbHash, computeScriptHash } from "@ckb-lumos/base/lib/utils";
 import { Cell, Hexadecimal, OutPoint, Script, Transaction, blockchain } from "@ckb-lumos/base";
 import { readFile, readdir } from "fs/promises";
 import { PathLike } from "fs";
 import { Indexer } from "@ckb-lumos/ckb-indexer";
 import { hexify } from "@ckb-lumos/codec/lib/bytes";
-import { struct } from "@ckb-lumos/codec/lib/molecule/layout";
+import { struct, vector } from "@ckb-lumos/codec/lib/molecule";
 import { Uint64, Uint8 } from "@ckb-lumos/codec/lib/number";
-import { Byte32, HashType as HashTypeCodec, createFixedHexBytesCodec } from "@ckb-lumos/base/lib/blockchain";
-import { BytesLike } from "@ckb-lumos/codec/lib/base";
-import { HashType, HexString } from "@ckb-lumos/base";
+import { Byte32, HashType as HashTypeCodec } from "@ckb-lumos/base/lib/blockchain";
+import { BytesLike, PackParam, UnpackResult, bytes, createBytesCodec } from "@ckb-lumos/codec";
+
 
 let _nodeUrl: string | undefined;
 
@@ -183,7 +181,7 @@ export async function createDepGroup(account: Account) {
         ),
     ];
 
-    let packedOutPoints = molecule.vector(blockchain.OutPoint).pack(outPoints);
+    let packedOutPoints = vector(blockchain.OutPoint).pack(outPoints);
     let hexOutPoints = "0x" + Buffer.from(packedOutPoints).toString('hex');
     const cell: Cell = {
         cellOutput: {
@@ -274,45 +272,41 @@ export const ReceiptCodec = {
     },
 };
 
-const createParametricLimitOrderCodec = (argsLength: number) => {
-    const ParametricScriptCodec = struct(
-        {
-            codeHash: Byte32,
-            hashType: HashTypeCodec,
-            args: createFixedHexBytesCodec(argsLength),
-        },
-        ["codeHash", "hashType", "args"]
-    );
 
-    return struct(
-        {
-            sudtHash: Byte32,
-            isSudtToCkb: Uint8,
-            sudtMultiplier: Uint64,
-            ckbMultiplier: Uint64,
-            terminalLock: ParametricScriptCodec,
-        },
-        ["sudtHash", "isSudtToCkb", "sudtMultiplier", "ckbMultiplier", "terminalLock"]
-    );
-}
+// Credits to @homura for the LimitOrderCodec implementation:
+// https://github.com/ckb-js/lumos/issues/539#issuecomment-1646452128
 
-interface LimitOrderFields {
-    sudtHash: BytesLike,
-    isSudtToCkb: BIish,
-    sudtMultiplier: BIish,
-    ckbMultiplier: BIish,
-    terminalLock: {
-        codeHash: BytesLike,
-        hashType: HashType,
-        args: HexString
-    }
-}
+const PartialLimitOrderCodec = struct(
+    {
+        sudtHash: Byte32,
+        isSudtToCkb: Uint8,
+        sudtMultiplier: Uint64,
+        ckbMultiplier: Uint64,
+        codeHash: Byte32,
+        hashType: HashTypeCodec,
+    },
+    ["sudtHash", "isSudtToCkb", "sudtMultiplier", "ckbMultiplier", "codeHash", "hashType"]
+);
 
-const minLimitOrderLength = createParametricLimitOrderCodec(0).byteLength;
+const ArgsLimitOrderCodec = createBytesCodec<{ args: string }, { args: BytesLike }>({
+    pack: (unpacked) => bytes.bytify(unpacked.args),
+    unpack: (packed) => ({ args: bytes.hexify(packed) }),
+});
 
-export const LimitOrderCodec = {
-    pack: (fields: LimitOrderFields) =>
-        createParametricLimitOrderCodec((fields.terminalLock.args.length - 2) / 2).pack(fields),
-    unpack: (data: Uint8Array) =>
-        createParametricLimitOrderCodec(data.length - minLimitOrderLength).unpack(data),
-};
+type PackableOrder = PackParam<typeof PartialLimitOrderCodec> & PackParam<typeof ArgsLimitOrderCodec>;
+type UnpackedOrder = UnpackResult<typeof PartialLimitOrderCodec> & UnpackResult<typeof ArgsLimitOrderCodec>;
+
+export const LimitOrderCodec = createBytesCodec<UnpackedOrder, PackableOrder>({
+    pack: (unpacked) => {
+        return bytes.concat(PartialLimitOrderCodec.pack(unpacked), ArgsLimitOrderCodec.pack(unpacked));
+    },
+    unpack: (packed): UnpackedOrder => {
+        const packedConfig = packed.slice(0, PartialLimitOrderCodec.byteLength)
+        const packedArgs = packed.slice(PartialLimitOrderCodec.byteLength)
+
+        const config = PartialLimitOrderCodec.unpack(packedConfig);
+        const args = ArgsLimitOrderCodec.unpack(packedArgs);
+
+        return { ...config, ...args };
+    },
+});
