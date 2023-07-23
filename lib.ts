@@ -1,6 +1,6 @@
 
 import { Account } from "./account";
-import { DEPOSIT_AMOUNT_LIMIT, calculateFee, defaultScript, getIndexer, getNodeUrl, getRPC, ickbSudtScript, parseEpoch, ReceiptCodec, scriptEq } from "./utils";
+import { calculateFee, defaultScript, getIndexer, getNodeUrl, getRPC, ickbSudtScript, parseEpoch, ReceiptCodec, scriptEq } from "./utils";
 import { secp256k1Blake160 } from "@ckb-lumos/common-scripts";
 import { RPC } from "@ckb-lumos/rpc";
 import { BI, parseUnit } from "@ckb-lumos/bi"
@@ -9,7 +9,7 @@ import { key } from "@ckb-lumos/hd";
 import { getConfig } from "@ckb-lumos/config-manager/lib";
 import { computeScriptHash } from "@ckb-lumos/base/lib/utils";
 import { bytes } from "@ckb-lumos/codec";
-import { Cell, Header, HexString, Hexadecimal, Script, Transaction, WitnessArgs, blockchain } from "@ckb-lumos/base";
+import { Cell, Header, Hexadecimal, Transaction, WitnessArgs, blockchain } from "@ckb-lumos/base";
 import { CellCollector, Indexer } from "@ckb-lumos/ckb-indexer";
 import { CKBIndexerQueryOptions } from "@ckb-lumos/ckb-indexer/lib/type";
 import { calculateDaoEarliestSinceCompatible, calculateMaximumWithdrawCompatible, extractDaoDataCompatible } from "@ckb-lumos/common-scripts/lib/dao";
@@ -127,11 +127,8 @@ export class TransactionBuilder {
         return this;
     }
 
-    deposit(depositAmount: BI, depositQuantity: BI) {
-        if (depositAmount.gte(DEPOSIT_AMOUNT_LIMIT)) {
-            throw Error(`depositAmount is ${depositAmount}, but should be less than ${DEPOSIT_AMOUNT_LIMIT.toString()}`);
-        }
 
+    deposit(depositQuantity: BI, depositAmount: BI) {
         if (depositQuantity.gt(61)) {
             throw Error(`depositQuantity is ${depositQuantity}, but should be less than 62`);
         }
@@ -154,7 +151,7 @@ export class TransactionBuilder {
                 type: defaultScript("ICKB_DOMAIN_LOGIC")
             },
 
-            data: ReceiptCodec.pack({ depositAmount, depositQuantity })
+            data: hexify(ReceiptCodec.pack({ depositQuantity, depositAmount }))
         };
 
         return this.add("output", "end", ...Array.from({ length: depositQuantity.toNumber() }, () => deposit), receipt);
@@ -294,8 +291,8 @@ export class TransactionBuilder {
             //iCKB Receipt
             if (scriptEq(c.cellOutput.type, ickbDomainLogicType)) {
                 const header = await this.#getHeader(c);
-                const { depositAmount, depositQuantity } = ReceiptCodec.unpack(c.data);
-                ickbDelta = ickbDelta.add(receiptIckbValue(depositAmount, depositQuantity, header));
+                const { depositQuantity, depositAmount } = ReceiptCodec.unpack(c.data);
+                ickbDelta = ickbDelta.add(receiptIckbValue(depositQuantity, depositAmount, header));
             }
         }
 
@@ -376,8 +373,8 @@ export function ickbValue(ckbUnoccupiedCapacity: BI, header: Header) {
     return ickbAmount;
 }
 
-export function receiptIckbValue(receiptAmount: BI, receiptCount: BI, header: Header) {
-    return ickbValue(receiptAmount, header).mul(receiptCount);
+export function receiptIckbValue(receiptCount: BI, receiptAmount: BI, header: Header) {
+    return receiptCount.mul(ickbValue(receiptAmount, header));
 }
 
 export function ckbSoftCapPerDeposit(header: Header) {

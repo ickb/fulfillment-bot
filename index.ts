@@ -1,7 +1,7 @@
 import { Account, randomSecp256k1Account } from "./account";
 import { parseUnit, BI } from "@ckb-lumos/bi"
 import { TransactionBuilder } from "./lib";
-import { createDepGroup, defaultScript, deployCode, getIndexer, getNodeUrl, getRPC, initNodeUrl, scriptEq, setConfig } from "./utils";
+import { createDepGroup, defaultScript, deployCode, getIndexer, getNodeUrl, getRPC, initNodeUrl, setConfig } from "./utils";
 import { ckbSoftCapPerDeposit } from "./lib";
 import { Cell } from "@ckb-lumos/base";
 import { CellCollector } from "@ckb-lumos/ckb-indexer";
@@ -37,7 +37,7 @@ async function main() {
 
     console.log("Creating a deposit phase one");
     const header = await rpc.getTipHeader();
-    const d1TxHash = await deposit1(account, ckbSoftCapPerDeposit(header), BI.from(61));
+    const d1TxHash = await deposit1(account, BI.from(61), ckbSoftCapPerDeposit(header));
     console.log(d1TxHash + " ✓");
 
     console.log("Creating a deposit phase two");
@@ -55,8 +55,8 @@ async function main() {
     // console.log("iCKB SUDT token at: ", depositPhaseTwoOutpoints["ickbSudt"]);
 }
 
-async function deposit1(account: Account, depositAmount: BI, depositQuantity: BI) {
-    const { txHash } = await (await new TransactionBuilder(account).fund()).deposit(depositAmount, depositQuantity).buildAndSend();
+async function deposit1(account: Account, depositQuantity: BI, depositAmount: BI) {
+    const { txHash } = await (await new TransactionBuilder(account).fund()).deposit(depositQuantity, depositAmount).buildAndSend();
     return txHash;
 }
 

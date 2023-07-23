@@ -9,11 +9,13 @@ import { Cell, Hexadecimal, OutPoint, Script, Transaction, blockchain } from "@c
 import { readFile, readdir } from "fs/promises";
 import { PathLike } from "fs";
 import { Indexer } from "@ckb-lumos/ckb-indexer";
-import { hexify } from "@ckb-lumos/codec/lib/bytes";
 import { struct, vector } from "@ckb-lumos/codec/lib/molecule";
-import { Uint64, Uint8 } from "@ckb-lumos/codec/lib/number";
+import { Uint64 } from "@ckb-lumos/codec/lib/number";
 import { Byte32, HashType as HashTypeCodec } from "@ckb-lumos/base/lib/blockchain";
-import { BytesLike, PackParam, UnpackResult, bytes, createBytesCodec } from "@ckb-lumos/codec";
+import { BytesLike, PackParam, UnpackResult, createBytesCodec } from "@ckb-lumos/codec";
+import { createUintBICodec } from "./uint";
+import { bytify, concat, hexify } from "@ckb-lumos/codec/lib/bytes";
+import { createFixedBytesCodec } from "@ckb-lumos/codec/lib/base";
 
 
 let _nodeUrl: string | undefined;
@@ -240,7 +242,7 @@ export async function setConfig(name2PartialScriptConfig: {
     for (const scriptName of await getLocalScriptNames()) {
         scriptConfigs[scriptName.toUpperCase()] = {
             CODE_HASH: ckbHash(await readFile(BINARIES_FILEPATH + scriptName)),
-            HASH_TYPE: "data",
+            HASH_TYPE: scriptName == "sudt" ? "data" : "data1",
             TX_HASH: genesisBlock.transactions[0].hash!,//Dummy value
             INDEX: "0x42",//Dummy value
             DEP_TYPE: "code",
@@ -257,21 +259,21 @@ export async function setConfig(name2PartialScriptConfig: {
     // console.log(getConfig());
 }
 
-export const DEPOSIT_AMOUNT_LIMIT = BI.from(2n ** (6n * 8n));
-
-export const ReceiptCodec = {
-    pack: (fields: { depositAmount: BI, depositQuantity: BI }) => {
-        return hexify(Uint64.pack(DEPOSIT_AMOUNT_LIMIT.mul(fields.depositQuantity).add(fields.depositAmount)));
+export const ReceiptCodec = struct(
+    {
+        depositQuantity: createUintBICodec(2, true),
+        depositAmount: createUintBICodec(6, true),
     },
-    unpack: (packedData: Hexadecimal) => {
-        const data = Uint64.unpack(packedData)
-        const depositAmount = data.mod(DEPOSIT_AMOUNT_LIMIT);
-        const depositQuantity = data.div(DEPOSIT_AMOUNT_LIMIT);
+    ["depositQuantity", "depositAmount"]
+);
 
-        return { depositAmount, depositQuantity };
+const Boolean = createFixedBytesCodec<boolean>(
+    {
+        byteLength: 1,
+        pack: (packable) => new Uint8Array([packable ? 1 : 0]),
+        unpack: (unpackable) => unpackable.at(0)! === 0 ? false : true,
     },
-};
-
+);
 
 // Credits to @homura for the LimitOrderCodec implementation:
 // https://github.com/ckb-js/lumos/issues/539#issuecomment-1646452128
@@ -279,7 +281,7 @@ export const ReceiptCodec = {
 const PartialLimitOrderCodec = struct(
     {
         sudtHash: Byte32,
-        isSudtToCkb: Uint8,
+        isSudtToCkb: Boolean,
         sudtMultiplier: Uint64,
         ckbMultiplier: Uint64,
         codeHash: Byte32,
@@ -289,8 +291,8 @@ const PartialLimitOrderCodec = struct(
 );
 
 const ArgsLimitOrderCodec = createBytesCodec<{ args: string }, { args: BytesLike }>({
-    pack: (unpacked) => bytes.bytify(unpacked.args),
-    unpack: (packed) => ({ args: bytes.hexify(packed) }),
+    pack: (unpacked) => bytify(unpacked.args),
+    unpack: (packed) => ({ args: hexify(packed) }),
 });
 
 type PackableOrder = PackParam<typeof PartialLimitOrderCodec> & PackParam<typeof ArgsLimitOrderCodec>;
@@ -298,7 +300,7 @@ type UnpackedOrder = UnpackResult<typeof PartialLimitOrderCodec> & UnpackResult<
 
 export const LimitOrderCodec = createBytesCodec<UnpackedOrder, PackableOrder>({
     pack: (unpacked) => {
-        return bytes.concat(PartialLimitOrderCodec.pack(unpacked), ArgsLimitOrderCodec.pack(unpacked));
+        return concat(PartialLimitOrderCodec.pack(unpacked), ArgsLimitOrderCodec.pack(unpacked));
     },
     unpack: (packed): UnpackedOrder => {
         const packedConfig = packed.slice(0, PartialLimitOrderCodec.byteLength)
