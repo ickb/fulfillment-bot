@@ -13,7 +13,7 @@ import { Cell, Header, Hexadecimal, Transaction, WitnessArgs, blockchain } from 
 import { CellCollector, Indexer } from "@ckb-lumos/ckb-indexer";
 import { CKBIndexerQueryOptions } from "@ckb-lumos/ckb-indexer/lib/type";
 import { calculateDaoEarliestSinceCompatible, calculateMaximumWithdrawCompatible, extractDaoDataCompatible } from "@ckb-lumos/common-scripts/lib/dao";
-import { Uint128LE, Uint64LE } from "@ckb-lumos/codec/lib/number/uint";
+import { Uint128LE, Uint32LE, Uint64LE } from "@ckb-lumos/codec/lib/number/uint";
 import { hexify } from "@ckb-lumos/codec/lib/bytes";
 
 export class TransactionBuilder {
@@ -45,7 +45,7 @@ export class TransactionBuilder {
         const sudtCells = await this.#collect({ type: ickbSudtScript() });
         this.add("input", "end", ...capacityCells, ...sudtCells);
 
-        const ickbDomainLogicScript = defaultScript("ICKB_DOMAIN_LOGIC")
+        const ickbDomainLogicScript = defaultScript("DOMAIN_LOGIC")
 
         const receiptCells = await this.#collect({ type: ickbDomainLogicScript });
         const ownerLockCells = await this.#collect({ lock: ickbDomainLogicScript, type: "empty", withData: false });//////////////////
@@ -65,22 +65,34 @@ export class TransactionBuilder {
 
         const unlockableWithdrawedDaoCells: Cell[] = [];
         const currentEpoch = parseEpoch((await this.#rpc.getTipHeader()).epoch);
-        for (const c of await this.#collect({ type: defaultScript("DAO") })) {
-            if (c.data === "0x0000000000000000") {
-                continue;
+        const ownerOwnedScript = defaultScript("OWNER_OWNED");
+        for (const ownerOwnedCell of await this.#collect({ type: ownerOwnedScript })) {
+            let withdrawalRequests: Cell[] = [];
+            for (const c of await this.#collect({
+                lock: ownerOwnedScript,
+                type: defaultScript("DAO"),
+                fromBlock: ownerOwnedCell.blockNumber,
+                toBlock: ownerOwnedCell.blockNumber,
+            })) {
+                if (c.data === "0x0000000000000000") {
+                    continue;
+                }
+
+                if (c.outPoint!.txHash != ownerOwnedCell.outPoint!.txHash) {
+                    continue;
+                }
+
+                const unlockEpoch = parseEpoch(await this.#withdrawedDaoSince(c));
+
+                if (currentEpoch.number.lt(unlockEpoch.number) || currentEpoch.index.mul(unlockEpoch.length).lt(unlockEpoch.index.mul(currentEpoch.length))) {
+                    //Due to owner owned script either all or none can be unlocked
+                    withdrawalRequests = [];
+                    break
+                }
+
+                withdrawalRequests.push(c);
             }
-
-            const unlockEpoch = parseEpoch(await this.#withdrawedDaoSince(c));
-
-            if (currentEpoch.number.lt(unlockEpoch.number)) {
-                continue;
-            }
-
-            if (currentEpoch.index.mul(unlockEpoch.length).lt(unlockEpoch.index.mul(currentEpoch.length))) {
-                continue;
-            }
-
-            unlockableWithdrawedDaoCells.push(c);
+            unlockableWithdrawedDaoCells.push(ownerOwnedCell, ...withdrawalRequests);
         }
         this.add("input", "end", ...unlockableWithdrawedDaoCells);
 
@@ -137,7 +149,7 @@ export class TransactionBuilder {
         const deposit = {
             cellOutput: {
                 capacity: parseUnit("82", "ckb").add(depositAmount).toHexString(),
-                lock: defaultScript("ICKB_DOMAIN_LOGIC"),
+                lock: defaultScript("DOMAIN_LOGIC"),
                 type: defaultScript("DAO"),
             },
             data: hexify(Uint64LE.pack(0))
@@ -148,7 +160,7 @@ export class TransactionBuilder {
             cellOutput: {
                 capacity: parseUnit("102", "ckb").toHexString(),
                 lock: this.#account.lockScript,
-                type: defaultScript("ICKB_DOMAIN_LOGIC")
+                type: defaultScript("DOMAIN_LOGIC")
             },
 
             data: hexify(ReceiptCodec.pack({ depositQuantity, depositAmount }))
@@ -159,12 +171,13 @@ export class TransactionBuilder {
 
     withdrawFrom(...deposits: Cell[]) {
         const dao = defaultScript("DAO");
+        const ownerOwnedScript = defaultScript("OWNER_OWNED");
         const withdrawals: Cell[] = [];
         for (const deposit of deposits) {
             const withdrawal = {
                 cellOutput: {
                     capacity: deposit.cellOutput.capacity,
-                    lock: this.#account.lockScript,
+                    lock: ownerOwnedScript,
                     type: dao
                 },
                 data: hexify(Uint64LE.pack(BI.from(deposit.blockNumber)))
@@ -172,7 +185,18 @@ export class TransactionBuilder {
             withdrawals.push(withdrawal);
         }
 
-        return this.add("input", "start", ...deposits).add("output", "start", ...withdrawals);
+        const ownerOwnedCell = {
+            cellOutput: {
+                capacity: parseUnit("98", "ckb").toHexString(),
+                lock: this.#account.lockScript,
+                type: ownerOwnedScript,
+            },
+            data: hexify(Uint32LE.pack(BI.from(deposits.length)))
+        };
+
+        return this.add("input", "start", ...deposits)
+            .add("output", "start", ...withdrawals)
+            .add("output", "end", ownerOwnedCell);
     }
 
     hasWithdrawalPhase2() {
@@ -267,7 +291,7 @@ export class TransactionBuilder {
 
     async getIckbDelta() {
         const daoType = defaultScript("DAO");
-        const ickbDomainLogicType = defaultScript("ICKB_DOMAIN_LOGIC");
+        const ickbDomainLogicType = defaultScript("DOMAIN_LOGIC");
         const ickbSudtType = ickbSudtScript();
 
         let ickbDelta = BI.from(0);
@@ -411,7 +435,7 @@ async function addHeaderDeps(transaction: TransactionSkeletonType, blockNumber2B
     }
 
     const daoType = defaultScript("DAO");
-    const ickbDomainLogicType = defaultScript("ICKB_DOMAIN_LOGIC");
+    const ickbDomainLogicType = defaultScript("DOMAIN_LOGIC");
     const uniqueBlockHashes: Set<string> = new Set();
     for (const c of transaction.inputs) {
         if (!c.blockHash || !c.blockNumber) {

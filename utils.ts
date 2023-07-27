@@ -100,7 +100,7 @@ export function defaultScript(name: string): Script {
 
 export function ickbSudtScript(): Script {
     let SUDT = getConfig().SCRIPTS.SUDT!;
-    let ickbDomainLogic = getConfig().SCRIPTS.ICKB_DOMAIN_LOGIC;
+    let ickbDomainLogic = getConfig().SCRIPTS.DOMAIN_LOGIC;
     if (!ickbDomainLogic) {
         throw Error(name + " not found");
     }

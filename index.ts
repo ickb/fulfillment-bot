@@ -73,7 +73,7 @@ async function withdraw1(account: Account) {
     const collector = new CellCollector(indexer, {
         scriptSearchMode: "exact",
         withData: true,
-        lock: defaultScript("ICKB_DOMAIN_LOGIC"),
+        lock: defaultScript("DOMAIN_LOGIC"),
         type: defaultScript("DAO"),
     }, {
         withBlockHash: true,
