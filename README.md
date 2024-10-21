@@ -1,4 +1,4 @@
-# iCKB v1 bot demo
+# iCKB v0 demo
 
 ## Setup
 
